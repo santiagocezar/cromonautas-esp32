@@ -1,0 +1,8 @@
+[package]
+name = "colorutils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+color = "0.3.1"
+float-cmp = "0.10.0"
