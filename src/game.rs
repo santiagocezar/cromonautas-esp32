@@ -13,22 +13,23 @@ pub enum Message {
     Tick,
 }
 
+struct RoundConfig {
+    difficulty: u8,
+    remaining: u8,
+    secret: [u8; 3],
+    now: DateTime<Utc>,
+}
+
 pub enum Event {
-    RoundStart {
-        difficulty: u8,
-        remaining: u8,
-        secret: [u8; 3],
-        now: DateTime<Utc>,
-    },
+    RoundStart(RoundConfig),
+    RoundConfig(RoundConfig),
     GuessResult {
         client: ClientID,
         rgb: [u8; 3],
         closeness: u8,
         closest: bool,
     },
-    SecretColor {
-        rgb: [u8; 3],
-    },
+    // TODO: SACAR ESTO...?
     Tick {
         remaining: u8,
         now: DateTime<Utc>,
@@ -65,6 +66,8 @@ fn random_color() -> [u8; 3] {
     }
 }
 
+const DIFF: f32 = 85.;
+
 impl GameState {
     pub fn new() -> Self {
         Self {
@@ -72,40 +75,48 @@ impl GameState {
             closest_color: [0, 0, 0],
             closest_client: None,
             closeness: 0.,
-            threshold: 80.,
+            threshold: DIFF,
             round_time: 0,
             animation: None,
             animation_duration: 0,
         }
     }
 
-    pub fn restart(&mut self) {
+    fn round_config(&self) -> RoundConfig {
+        let st: DateTime<Utc> = SystemTime::now().into();
+        info!("round started at {}", st.format("%H:%M:%S"));
+
+        RoundConfig {
+            difficulty: self.threshold as u8,
+            remaining: self.round_time,
+            secret: self.secret_color,
+            now: st,
+        }
+    }
+
+    pub fn restart(&mut self) -> Event {
         self.secret_color = random_color();
         self.closest_color = [0, 0, 0];
         self.closest_client = None;
         self.closeness = 0.;
-        self.threshold = 90.;
+        self.threshold = DIFF;
         self.round_time = 40;
+
+        return Event::RoundStart(self.round_config());
     }
 
     pub fn recv(&mut self, msg: Message) -> Option<Event> {
         match msg {
             Message::Hello => {
-                self.restart();
+                if self.round_time == 0 {
+                    return Some(self.restart());
+                }
 
-                let st: DateTime<Utc> = SystemTime::now().into();
-                info!("round started at {}", st.format("%H:%M:%S"));
-
-                Some(Event::RoundStart {
-                    difficulty: self.threshold as u8,
-                    remaining: self.round_time,
-                    secret: self.secret_color,
-                    now: st,
-                })
+                Some(Event::RoundConfig(self.round_config()))
             }
             Message::GuessColor { client, rgb } => {
-                let secret = colorutils::rgb8_to_hsl(&self.secret_color);
-                let guess = colorutils::rgb8_to_hsl(&rgb);
+                let secret = colorutils::rgb8_to_oklab(&self.secret_color);
+                let guess = colorutils::rgb8_to_oklab(&rgb);
 
                 let c = colorutils::closeness(&secret, &guess);
 
@@ -147,20 +158,12 @@ impl GameState {
                     }
 
                     if self.round_time == 0 {
-                        self.restart();
-                        info!("round started at {}", st.format("%H:%M:%S"));
-
-                        return Some(Event::RoundStart {
-                            difficulty: self.threshold as u8,
-                            remaining: self.round_time,
-                            secret: self.secret_color,
-                            now: st,
-                        });
+                        return Some(self.restart());
                     }
                 }
 
                 Some(Event::Tick {
-                    remaining: self.round_time.try_into().unwrap_or(255),
+                    remaining: self.round_time,
                     now: st,
                 })
             }
@@ -228,14 +231,12 @@ const HELLO: u8 = 1;
 const GUESS_COLOR: u8 = 2;
 // ciiiirgbd c: command, i: client id, rgb: color, d: distance
 const GUESS_RESULT: u8 = 3;
-// ciiii...  c: command, i: client id, ...: display name
-const HELLO_ACK: u8 = 4;
-// crgb      c: command, rgb: color
-const SET_SECRET_COLOR: u8 = 5;
 // crstttttttt      c: command, r: remaining, s: restart, t: timestamp
 const TICK: u8 = 6;
 // cdTrgbtttttttt  c: command, d: difficulty, T: remaining, t: timestamp
 const ROUND_START: u8 = 7;
+// cdTrgbtttttttt  c: command, d: difficulty, T: remaining, t: timestamp
+const ROUND_CONFIG: u8 = 8;
 
 impl TryFrom<&[u8]> for Message {
     type Error = &'static str;
@@ -267,17 +268,19 @@ impl Event {
         let mut vec = Vec::new();
 
         match self {
-            &Self::RoundStart {
-                difficulty,
-                remaining,
-                secret,
-                now,
-            } => {
+            Self::RoundConfig(config) => {
+                vec.push(ROUND_CONFIG).unwrap();
+                vec.push(config.difficulty).unwrap();
+                vec.push(config.remaining).unwrap();
+                vec.extend(config.secret);
+                vec.extend(config.now.timestamp().to_be_bytes());
+            }
+            Self::RoundStart(config) => {
                 vec.push(ROUND_START).unwrap();
-                vec.push(difficulty).unwrap();
-                vec.push(remaining).unwrap();
-                vec.extend(secret);
-                vec.extend(now.timestamp().to_be_bytes());
+                vec.push(config.difficulty).unwrap();
+                vec.push(config.remaining).unwrap();
+                vec.extend(config.secret);
+                vec.extend(config.now.timestamp().to_be_bytes());
             }
             &Self::GuessResult {
                 client,
@@ -289,10 +292,6 @@ impl Event {
                 vec.extend(client);
                 vec.extend(rgb);
                 vec.push(closeness | (closest as u8) << 7).unwrap();
-            }
-            Self::SecretColor { rgb } => {
-                vec.push(SET_SECRET_COLOR).unwrap();
-                vec.extend(*rgb);
             }
             Self::Tick { remaining, now } => {
                 vec.push(TICK).unwrap();

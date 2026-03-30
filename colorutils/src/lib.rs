@@ -1,4 +1,4 @@
-use color::{ColorSpace, Hsl, LinearSrgb, Srgb};
+use color::{ColorSpace, Hsl, LinearSrgb, Oklab, Srgb};
 
 pub fn linear_to_srgb(color: &[u8; 3]) -> [u8; 3] {
     Srgb::convert::<LinearSrgb>(color.map(|c| (c as f32) / 255.)).map(|c| ((1. - c) * 255.) as u8)
@@ -6,6 +6,10 @@ pub fn linear_to_srgb(color: &[u8; 3]) -> [u8; 3] {
 
 pub fn rgb8_to_hsl(rgb: &[u8; 3]) -> [f32; 3] {
     Srgb::convert::<Hsl>(rgb.map(|c| c as f32 / 255.))
+}
+
+pub fn rgb8_to_oklab(rgb: &[u8; 3]) -> [f32; 3] {
+    Srgb::convert::<Oklab>(rgb.map(|c| c as f32 / 255.))
 }
 
 pub fn hsl_to_xy(&[h, s, l]: &[f32; 3]) -> (f32, f32) {
@@ -17,10 +21,19 @@ pub fn hsl_to_xy(&[h, s, l]: &[f32; 3]) -> (f32, f32) {
     (r * h.cos() * 50., r * h.sin() * 50.)
 }
 
-pub fn closeness(c1: &[f32; 3], c2: &[f32; 3]) -> f32 {
+pub fn closeness_hsl(c1: &[f32; 3], c2: &[f32; 3]) -> f32 {
     let (x1, y1) = hsl_to_xy(c1);
     let (x2, y2) = hsl_to_xy(c2);
     return 100. - ((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt();
+}
+
+pub fn closeness(c1: &[f32; 3], c2: &[f32; 3]) -> f32 {
+    100. - dist_euclidian(c1, c2) * 100.
+}
+
+pub fn dist_euclidian(c1: &[f32; 3], c2: &[f32; 3]) -> f32 {
+    let dist = (c2[0] - c1[0]).powi(2) + (c2[1] - c1[1]).powi(2) + (c2[2] - c1[2]).powi(2);
+    return dist.sqrt();
 }
 
 #[cfg(test)]
@@ -36,6 +49,18 @@ mod tests {
         a.into_iter()
             .zip(b.into_iter())
             .for_each(|(a, b)| assert_approx_eq!(f32, a, b, (0.0, 2)));
+    }
+
+    #[test]
+    fn test_oklab() {
+        let black = rgb8_to_oklab(&[0, 0, 10]);
+        let white = rgb8_to_oklab(&[0, 10, 0]);
+
+        let dist = dist_euclidian(&black, &white);
+
+        println!("dist: {dist:?}");
+        println!("white: {white:?}");
+        println!("white: {white:?}");
     }
 
     #[test]

@@ -31,8 +31,8 @@ use crate::rgbdriver::RGBDriver;
 // const SSID: &str = "WIFI_SSID";
 // const PASSWORD: &str = "WIFI_PASS";
 
-// const MQTT_URL: &str = "mqtt://broker.emqx.io:1883";
-const MQTT_URL: &str = "mqtt://public.cez.ar:1883";
+const MQTT_URL: &str = "mqtt://broker.emqx.io:1883";
+// const MQTT_URL: &str = "mqtt://public.cez.ar:1883";
 const MQTT_CLIENT_ID: &str = "esp-mqtt-demo";
 const TOPIC_CLIENTS: &str = "santiagocezar/rgblitz/clients";
 const TOPIC_GAME: &str = "santiagocezar/rgblitz/game";
@@ -76,7 +76,7 @@ fn main() {
 
     info!("executing cool loading thing...");
 
-    let (_wifi, mut client, mut conn) = std::thread::scope(|s| {
+    let _wifi = std::thread::scope(|s| {
         let led1 = &mut led1;
         let led2 = &mut led2;
 
@@ -122,85 +122,61 @@ fn main() {
 
         while ntp.get_sync_status() != SyncStatus::Completed {}
 
-        info!("connecting to mqtt...");
-
-        let (client, conn) = mqtt_create(MQTT_URL, MQTT_CLIENT_ID).unwrap();
-
         callback_timer.cancel().unwrap();
 
-        (wifi, client, conn)
+        wifi
     });
 
     info!("entering main loop...");
 
-    run(&mut client, &mut conn, led1, led2).unwrap();
+    run(led1, led2).unwrap();
 }
 
-fn run(
-    client: &mut EspMqttClient<'_>,
-    connection: &mut EspMqttConnection,
-    mut led1: RGBDriver,
-    mut led2: RGBDriver,
-) -> Result<(), EspError> {
+fn run(mut led1: RGBDriver, mut led2: RGBDriver) -> Result<(), EspError> {
+    let (mut client, mut connection) = mqtt_create(MQTT_URL, MQTT_CLIENT_ID).unwrap();
+
     std::thread::scope(|s| {
         let mut game = GameState::new();
         game.update_leds(&mut led1, &mut led2)?;
 
         let (tx, rx) = mpsc::channel::<Message>();
 
+        std::thread::Builder::new()
+            .stack_size(6000)
+            .spawn_scoped(s, {
+                let tx = tx.clone();
+                move || {
+                    info!("MQTT Listening for messages");
+
+                    while let Ok(event) = connection.next() {
+                        let payload = event.payload();
+                        info!("[Queue] Event: {}", payload);
+                        match payload {
+                            EventPayload::Received { data, .. } => match Message::try_from(data) {
+                                Ok(msg) => {
+                                    tx.send(msg).unwrap();
+                                }
+                                Err(e) => info!("invalid message: {e}"),
+                            },
+                            _ => {}
+                        }
+                    }
+
+                    info!("Connection closed");
+                }
+            })
+            .unwrap();
+
         let timer_service = EspTaskTimerService::new()?;
         let callback_timer = {
-            let tx = tx.clone();
             timer_service.timer(move || {
                 tx.send(Message::Tick).unwrap();
             })?
         };
 
-        callback_timer.every(Duration::from_secs(1))?;
-        info!("About to start the MQTT client");
+        // Just to give a chance of our connection to get even the first published message
 
-        // Need to immediately start pumping the connection for messages, or else subscribe() and publish() below will not work
-        // Note that when using the alternative constructor - `EspMqttClient::new_cb` - you don't need to
-        // spawn a new thread, as the messages will be pumped with a backpressure into the callback you provide.
-        // Yet, you still need to efficiently process each message in the callback without blocking for too long.
-        //
-        // Note also that if you go to http://tools.emqx.io/ and then connect and send a message to topic
-        // "esp-mqtt-demo", the client configured here should receive it.
-        std::thread::Builder::new()
-            .stack_size(6000)
-            .spawn_scoped(s, move || {
-                info!("MQTT Listening for messages");
-
-                while let Ok(event) = connection.next() {
-                    let payload = event.payload();
-                    info!("[Queue] Event: {}", payload);
-                    match payload {
-                        // EventPayload::BeforeConnect => todo!(),
-                        // EventPayload::Connected(_) => todo!(),
-                        // EventPayload::Disconnected => todo!(),
-                        // EventPayload::Subscribed(_) => todo!(),
-                        // EventPayload::Unsubscribed(_) => todo!(),
-                        // EventPayload::Published(_) => todo!(),
-                        // EventPayload::Deleted(_) => todo!(),
-                        // EventPayload::Error(_) => ,
-                        EventPayload::Received {
-                            id,
-                            topic,
-                            data,
-                            details,
-                        } => match Message::try_from(data) {
-                            Ok(msg) => {
-                                tx.send(msg).unwrap();
-                            }
-                            Err(e) => info!("invalid message: {e}"),
-                        },
-                        _ => {}
-                    }
-                }
-
-                info!("Connection closed");
-            })
-            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
 
         while let Err(e) = client.subscribe(TOPIC_CLIENTS, QoS::AtMostOnce) {
             error!("Failed to subscribe to topic \"{TOPIC_CLIENTS}\": {e}, retrying...");
@@ -213,11 +189,10 @@ fn run(
 
         info!("Subscribed to topic \"{TOPIC_CLIENTS}\"");
 
-        // Just to give a chance of our connection to get even the first published message
-        std::thread::sleep(Duration::from_millis(500));
+        callback_timer.every(Duration::from_secs(1))?;
 
         loop {
-            let msg = rx.recv_timeout(Duration::from_millis(10)).ok();
+            let msg = rx.try_recv().ok();
             let res = if let Some(msg) = msg {
                 game.recv(msg)
             } else {
@@ -229,6 +204,8 @@ fn run(
             if let Some(res) = res {
                 client.enqueue(TOPIC_GAME, QoS::ExactlyOnce, false, &res.as_bytes())?;
             }
+
+            std::thread::sleep(Duration::from_millis(10));
         }
     })
 }

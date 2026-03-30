@@ -1,10 +1,14 @@
 flash:
     cargo build
-    espflash flash -M target/xtensa-esp32-espidf/debug/rustgblitz
+    espflash flash -B 921600 -M target/xtensa-esp32-espidf/debug/rustgblitz
+
+flash_slow:
+    cargo build
+    espflash flash -B 115200 -M target/xtensa-esp32-espidf/debug/rustgblitz
 
 flash_release:
     cargo build --release
-    espflash flash -M target/xtensa-esp32-espidf/release/rustgblitz
+    espflash flash -B 921600 -M target/xtensa-esp32-espidf/release/rustgblitz
 
 mon:
     espflash monitor
