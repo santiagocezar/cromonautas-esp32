@@ -1,6 +1,8 @@
 //! MQTT blocking client example which subscribes to an internet MQTT server and then sends
 //! and receives events in its own topic.
 
+capnp::generated_code!(pub mod message_capnp);
+
 mod game;
 mod rgbdriver;
 
@@ -152,12 +154,14 @@ fn run(mut led1: RGBDriver, mut led2: RGBDriver) -> Result<(), EspError> {
                         let payload = event.payload();
                         info!("[Queue] Event: {}", payload);
                         match payload {
-                            EventPayload::Received { data, .. } => match Message::try_from(data) {
-                                Ok(msg) => {
-                                    tx.send(msg).unwrap();
+                            EventPayload::Received { data, .. } => {
+                                match Message::from_bytes(data) {
+                                    Ok(msg) => {
+                                        tx.send(msg).unwrap();
+                                    }
+                                    Err(e) => info!("invalid message: {e}"),
                                 }
-                                Err(e) => info!("invalid message: {e}"),
-                            },
+                            }
                             _ => {}
                         }
                     }
@@ -202,7 +206,12 @@ fn run(mut led1: RGBDriver, mut led2: RGBDriver) -> Result<(), EspError> {
             game.update_leds(&mut led1, &mut led2)?;
 
             if let Some(res) = res {
-                client.enqueue(TOPIC_GAME, QoS::ExactlyOnce, false, &res.as_bytes())?;
+                client.enqueue(
+                    TOPIC_GAME,
+                    QoS::ExactlyOnce,
+                    false,
+                    &res.as_bytes().unwrap(),
+                )?;
             }
 
             std::thread::sleep(Duration::from_millis(10));
@@ -243,7 +252,7 @@ fn wifi_create(
     for network in networks {
         let password = match network.ssid.as_str() {
             "WifiCR" => Some("CR2546938"),
-            "UTN_LIBRE_2.4G" => None,
+            "UTN_LIBRE" => None,
             _ => {
                 continue;
             }

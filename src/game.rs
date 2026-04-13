@@ -1,42 +1,145 @@
-use std::time::SystemTime;
+use std::{collections::HashMap, time::SystemTime};
 
 use chrono::{DateTime, Timelike, Utc};
+use core_json::{ConstStack, Deserializer};
 use esp_idf_svc::sys::{esp_random, EspError};
-use heapless::Vec;
+// use heapless::Vec;
 use log::*;
 
 use crate::rgbdriver::RGBDriver;
 
-pub enum Message {
-    Hello,
-    GuessColor { client: ClientID, rgb: [u8; 3] },
-    Tick,
-}
+use crate::message_capnp::{color, message, round_config};
+use capnp::serialize_packed;
 
 struct RoundConfig {
     difficulty: u8,
     remaining: u8,
     secret: [u8; 3],
     now: DateTime<Utc>,
+    restart: bool,
 }
 
-pub enum Event {
-    RoundStart(RoundConfig),
+pub enum Message {
+    Hello,
     RoundConfig(RoundConfig),
-    GuessResult {
+    GuessRequest {
+        client: ClientID,
+        rgb: [u8; 3],
+    },
+    GuessResponse {
         client: ClientID,
         rgb: [u8; 3],
         closeness: u8,
         closest: bool,
     },
-    // TODO: SACAR ESTO...?
-    Tick {
-        remaining: u8,
-        now: DateTime<Utc>,
-    },
+    Tick,
 }
 
-pub type ClientID = [u8; 4];
+impl Message {
+    pub fn from_bytes(b: &[u8]) -> ::capnp::Result<Self> {
+        let reader = serialize_packed::read_message(b, ::capnp::message::ReaderOptions::new())?;
+
+        let root = reader.get_root::<message::Reader>()?;
+
+        let res = match root.which()? {
+            message::Hello(()) => Self::Hello,
+            message::RoundConfig(config) => {
+                let config = config?;
+                let secret = config.reborrow().get_secret()?;
+
+                Self::RoundConfig(RoundConfig {
+                    difficulty: config.get_difficulty(),
+                    remaining: config.get_remaining(),
+                    secret: [secret.get_r(), secret.get_g(), secret.get_b()],
+                    now: DateTime::<Utc>::from_timestamp_millis(config.get_now()).unwrap(),
+                    restart: config.get_restart(),
+                })
+            }
+            message::GuessReq(req) => {
+                let rgb = req.reborrow().get_rgb()?;
+
+                Self::GuessRequest {
+                    client: req.get_client()?.to_string()?,
+                    rgb: [rgb.get_r(), rgb.get_g(), rgb.get_b()],
+                }
+            }
+            message::GuessRes(res) => {
+                let rgb = res.reborrow().get_rgb()?;
+
+                Self::GuessResponse {
+                    client: res.get_client()?.to_string()?,
+                    rgb: [rgb.get_r(), rgb.get_g(), rgb.get_b()],
+                    closeness: res.get_closeness(),
+                    closest: res.get_closest(),
+                }
+            }
+        };
+
+        Ok(res)
+    }
+    pub fn as_bytes(self) -> ::capnp::Result<Vec<u8>> {
+        let mut serialized = ::capnp::message::Builder::new_default();
+
+        let mut root = serialized.init_root::<message::Builder>();
+
+        match self {
+            Message::Hello => root.set_hello(()),
+            Message::RoundConfig(orig_config) => {
+                let mut config = root.init_round_config();
+
+                let mut color = config.reborrow().init_secret();
+
+                color.set_r(orig_config.secret[0]);
+                color.set_g(orig_config.secret[1]);
+                color.set_b(orig_config.secret[2]);
+
+                config.set_difficulty(orig_config.difficulty);
+                config.set_remaining(orig_config.remaining);
+                config.set_now(orig_config.now.timestamp_millis());
+                config.set_restart(orig_config.restart);
+            }
+            Message::GuessRequest { client, rgb } => {
+                let mut req = root.init_guess_req();
+
+                let mut color = req.reborrow().init_rgb();
+
+                color.set_r(rgb[0]);
+                color.set_g(rgb[1]);
+                color.set_b(rgb[2]);
+
+                req.set_client(client);
+            }
+            Message::GuessResponse {
+                client,
+                rgb,
+                closeness,
+                closest,
+            } => {
+                let mut res = root.init_guess_res();
+
+                let mut color = res.reborrow().init_rgb();
+
+                color.set_r(rgb[0]);
+                color.set_g(rgb[1]);
+                color.set_b(rgb[2]);
+
+                res.set_client(client);
+                res.set_closeness(closeness);
+                res.set_closest(closest);
+            }
+            _ => unimplemented!(),
+        }
+
+        let mut packed = Vec::new();
+
+        serialize_packed::write_message(&mut packed, &serialized)?;
+        // let mut people = root.init_people(2);
+        //
+        Ok(packed)
+    }
+}
+
+pub type ClientID = String;
 
 #[derive(Clone, Copy)]
 enum Animation {
@@ -91,10 +194,11 @@ impl GameState {
             remaining: self.round_time,
             secret: self.secret_color,
             now: st,
+            restart: false,
         }
     }
 
-    pub fn restart(&mut self) -> Event {
+    pub fn restart(&mut self) -> Message {
         self.secret_color = random_color();
         self.closest_color = [0, 0, 0];
         self.closest_client = None;
@@ -102,19 +206,22 @@ impl GameState {
         self.threshold = DIFF;
         self.round_time = 40;
 
-        return Event::RoundStart(self.round_config());
+        return Message::RoundConfig(RoundConfig {
+            restart: true,
+            ..self.round_config()
+        });
     }
 
-    pub fn recv(&mut self, msg: Message) -> Option<Event> {
+    pub fn recv(&mut self, msg: Message) -> Option<Message> {
         match msg {
             Message::Hello => {
                 if self.round_time == 0 {
                     return Some(self.restart());
                 }
 
-                Some(Event::RoundConfig(self.round_config()))
+                Some(Message::RoundConfig(self.round_config()))
             }
-            Message::GuessColor { client, rgb } => {
+            Message::GuessRequest { client, rgb } => {
                 let secret = colorutils::rgb8_to_oklab(&self.secret_color);
                 let guess = colorutils::rgb8_to_oklab(&rgb);
 
@@ -139,7 +246,7 @@ impl GameState {
                     }
                 }
 
-                Some(Event::GuessResult {
+                Some(Message::GuessResponse {
                     client,
                     rgb: rgb.clone(),
                     closeness: c as u8,
@@ -162,11 +269,9 @@ impl GameState {
                     }
                 }
 
-                Some(Event::Tick {
-                    remaining: self.round_time,
-                    now: st,
-                })
+                None
             }
+            _ => None,
         }
     }
 
@@ -238,68 +343,68 @@ const ROUND_START: u8 = 7;
 // cdTrgbtttttttt  c: command, d: difficulty, T: remaining, t: timestamp
 const ROUND_CONFIG: u8 = 8;
 
-impl TryFrom<&[u8]> for Message {
-    type Error = &'static str;
+// impl TryFrom<&[u8]> for Message {
+//     type Error = &'static str;
 
-    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
-        let Some(client) = data.get(1..=4) else {
-            return Err("data is too short (in general)");
-        };
+//     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+//         let Some(client) = data.get(1..=4) else {
+//             return Err("data is too short (in general)");
+//         };
 
-        match data[0] {
-            HELLO => Ok(Self::Hello),
-            GUESS_COLOR => {
-                if let Some(rgb) = data.get(5..=7) {
-                    Ok(Self::GuessColor {
-                        client: client.try_into().unwrap(),
-                        rgb: rgb.try_into().unwrap(),
-                    })
-                } else {
-                    Err("data is too short for GuessColor")
-                }
-            }
-            _ => Err("unknown command"),
-        }
-    }
-}
+//         match data[0] {
+//             HELLO => Ok(Self::Hello),
+//             GUESS_COLOR => {
+//                 if let Some(rgb) = data.get(5..=7) {
+//                     Ok(Self::GuessRequest {
+//                         client: client.try_into().unwrap(),
+//                         rgb: rgb.try_into().unwrap(),
+//                     })
+//                 } else {
+//                     Err("data is too short for GuessColor")
+//                 }
+//             }
+//             _ => Err("unknown command"),
+//         }
+//     }
+// }
 
-impl Event {
-    pub fn as_bytes(&self) -> Vec<u8, 16> {
-        let mut vec = Vec::new();
+// impl Event {
+//     pub fn as_bytes(&self) -> Vec<u8, 16> {
+//         let mut vec = Vec::new();
 
-        match self {
-            Self::RoundConfig(config) => {
-                vec.push(ROUND_CONFIG).unwrap();
-                vec.push(config.difficulty).unwrap();
-                vec.push(config.remaining).unwrap();
-                vec.extend(config.secret);
-                vec.extend(config.now.timestamp().to_be_bytes());
-            }
-            Self::RoundStart(config) => {
-                vec.push(ROUND_START).unwrap();
-                vec.push(config.difficulty).unwrap();
-                vec.push(config.remaining).unwrap();
-                vec.extend(config.secret);
-                vec.extend(config.now.timestamp().to_be_bytes());
-            }
-            &Self::GuessResult {
-                client,
-                rgb,
-                closeness,
-                closest,
-            } => {
-                vec.push(GUESS_RESULT).unwrap();
-                vec.extend(client);
-                vec.extend(rgb);
-                vec.push(closeness | (closest as u8) << 7).unwrap();
-            }
-            Self::Tick { remaining, now } => {
-                vec.push(TICK).unwrap();
-                vec.push(*remaining).unwrap();
-                vec.extend(now.timestamp().to_be_bytes());
-            }
-        }
+//         match self {
+//             Self::RoundConfig(config) => {
+//                 vec.push(ROUND_CONFIG).unwrap();
+//                 vec.push(config.difficulty).unwrap();
+//                 vec.push(config.remaining).unwrap();
+//                 vec.extend(config.secret);
+//                 vec.extend(config.now.timestamp().to_be_bytes());
+//             }
+//             Self::RoundStart(config) => {
+//                 vec.push(ROUND_START).unwrap();
+//                 vec.push(config.difficulty).unwrap();
+//                 vec.push(config.remaining).unwrap();
+//                 vec.extend(config.secret);
+//                 vec.extend(config.now.timestamp().to_be_bytes());
+//             }
+//             &Self::GuessResult {
+//                 client,
+//                 rgb,
+//                 closeness,
+//                 closest,
+//             } => {
+//                 vec.push(GUESS_RESULT).unwrap();
+//                 vec.extend(client);
+//                 vec.extend(rgb);
+//                 vec.push(closeness | (closest as u8) << 7).unwrap();
+//             }
+//             Self::Tick { remaining, now } => {
+//                 vec.push(TICK).unwrap();
+//                 vec.push(*remaining).unwrap();
+//                 vec.extend(now.timestamp().to_be_bytes());
+//             }
+//         }
 
-        vec
-    }
-}
+//         vec
+//     }
+// }

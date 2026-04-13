@@ -1,3 +1,8 @@
+update-toolchain:
+    #! /usr/bin/env nu
+
+    nix-shell -p nix-prefetch-docker --command "nix-prefetch-docker espressif/idf-rust all_latest"
+
 flash:
     cargo build
     espflash flash -B 921600 -M target/xtensa-esp32-espidf/debug/rustgblitz

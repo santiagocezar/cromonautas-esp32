@@ -33,6 +33,7 @@ embedded-svc = "0.28.1"
 heapless = "0.8.0"
 colorutils = { path = "./colorutils" }
 chrono = "0.4.41"
+capnp = "0.25.4"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
@@ -53,6 +54,7 @@ chrono = "0.4.41"
 
 [build-dependencies]
 embuild = "0.33"
+capnpc = "0.25.3"
 
 [workspace]
 members = ["colorutils"]
